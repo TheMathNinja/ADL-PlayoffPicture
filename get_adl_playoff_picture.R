@@ -2806,7 +2806,8 @@ publish_adl_html_to_github <- function(
     branch         = "main",
     remote         = "origin",
     commit_message = NULL,
-    open_browser   = TRUE
+    open_browser   = TRUE,
+    do_git         = TRUE    # NEW: toggle git stage/commit/push
 ) {
   season <- as.integer(season)
   week   <- as.integer(week)
@@ -2927,19 +2928,38 @@ publish_adl_html_to_github <- function(
   htmltools::save_html(index_page, file = index_path)
   message("Copied latest week to ", index_path)
   
-  # 2. Run Git commands inside repo_dir --------------------------------
+  # 2. Run Git commands inside repo_dir (optional) ---------------------
+  if (!do_git) {
+    message("Skipping git add/commit/push because do_git = FALSE.")
+    return(invisible(list(
+      latest_snapshot      = latest_snapshot,
+      latest_forecast_file = latest_forecast_file,
+      index_path           = index_path
+    )))
+  }
+  
   old_wd <- getwd()
   on.exit(setwd(old_wd), add = TRUE)
   setwd(repo_dir)
   
-  # Helper to run git commands and *suppress* noisy stdout/stderr
+  # Helper to run git and *show* its output if something goes wrong
   run_git <- function(cmd) {
     full_cmd <- paste("git", cmd)
-    status   <- system(full_cmd, ignore.stdout = TRUE, ignore.stderr = TRUE)
+    out <- tryCatch(
+      system(full_cmd, intern = TRUE),
+      error = function(e) {
+        stop("Git command failed: ", full_cmd, "\nError: ", conditionMessage(e))
+      }
+    )
+    status <- attr(out, "status")
+    if (is.null(status)) status <- 0L
     if (status != 0) {
-      stop("Git command failed (exit code ", status, "): ", full_cmd)
+      stop(
+        "Git command failed (exit code ", status, "): ", full_cmd,
+        "\nGit output:\n", paste(out, collapse = "\n")
+      )
     }
-    invisible(status)
+    invisible(out)
   }
   
   # 2a. Quick sanity check: are we actually in a git repo?
@@ -3002,6 +3022,7 @@ publish_adl_html_to_github <- function(
     index_path           = index_path
   ))
 }
+
 
 
 
