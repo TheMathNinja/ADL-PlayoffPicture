@@ -3064,11 +3064,32 @@ publish_adl_html_to_github <- function(
   # Helper to run git commands and *suppress* noisy stdout/stderr
   run_git <- function(cmd) {
     full_cmd <- paste("git", cmd)
-    status   <- system(full_cmd, ignore.stdout = TRUE, ignore.stderr = TRUE)
-    if (status != 0) {
-      stop("Git command failed (exit code ", status, "): ", full_cmd)
+    
+    # capture stdout; stderr will still print to the console if there is an error
+    out <- tryCatch(
+      system(full_cmd, intern = TRUE, ignore.stderr = FALSE),
+      warning = function(w) {
+        # system() with intern=TRUE returns a "status" attribute on failure
+        attr_out <- attr(w, "status")
+        status <- if (is.null(attr_out)) 1L else attr_out
+        stop(
+          "Git command failed (exit code ", status, ") running: ", full_cmd,
+          "\nGit says:\n", conditionMessage(w),
+          call. = FALSE
+        )
+      }
+    )
+    
+    status <- attr(out, "status")
+    if (!is.null(status) && status != 0L) {
+      stop(
+        "Git command failed (exit code ", status, ") running: ", full_cmd,
+        "\nGit says:\n", paste(out, collapse = "\n"),
+        call. = FALSE
+      )
     }
-    invisible(status)
+    
+    invisible(out)
   }
   
   # 2a. Quick sanity check: are we actually in a git repo?
