@@ -2047,7 +2047,8 @@ get_adl_playoff_picture <- function(
   }
   
   # Clamp to regular-season max
-  week_max <- min(week, max_week)
+  week_max    <- min(week, max_week)
+  display_week <- week_max + 1L   # label "Week {display_week}" shown to users
   
   # -------------------------------------------------
   # 1. Current season-to-date standings & live seeds
@@ -2311,7 +2312,7 @@ get_adl_playoff_picture <- function(
   graphics_list <- build_adl_playoff_graphic(
     adl_picture = snapshot_for_graphic,
     season      = season,
-    week        = week_max
+    week        = week_max  # "after Week {week_max}" for table subtitles
   )
   
   nfc_gt   <- graphics_list$playoff_nfc
@@ -2321,14 +2322,14 @@ get_adl_playoff_picture <- function(
   out_dir <- "C:/Users/filim/Documents/R/LeagueFeatures/PlayoffPicture"
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
   
-  # File names for this WEEK
+  # File names use the *display* week number (so "Week 9" -> W09)
   html_file <- file.path(
     out_dir,
-    sprintf("ADL_%d_W%02d_playoff_and_draft_forecast.html", season, week_max)
+    sprintf("ADL_%d_W%02d_playoff_and_draft_forecast.html", season, display_week)
   )
   full_df_file <- file.path(
     out_dir,
-    sprintf("ADL_%d_W%02d_full_dataframe.html", season, week_max)
+    sprintf("ADL_%d_W%02d_full_dataframe.html", season, display_week)
   )
   
   # Render gt tables to raw HTML
@@ -2341,22 +2342,21 @@ get_adl_playoff_picture <- function(
   full_df_html <- gt::as_raw_html(full_df_gt)
   
   last_updated_str <- format(Sys.time(), tz = "America/New_York", usetz = TRUE)
-  display_week     <- week_max + 1L
   
-  # ---------- WEEK DROPDOWN (inline, no helper) ----------
-  week_seq <- seq_len(weeks_completed)
+  # ---------- WEEK DROPDOWN (inline, always all weeks, descending) ----------
+  # We label and link by *display* week number: W02, W03, ..., W13
+  week_seq <- rev(seq_len(weeks_completed))
   
   week_options <- vapply(week_seq, FUN.VALUE = character(1L), function(w) {
     display_w <- w + 1L
-    href <- if (w == weeks_completed) {
-      "./"  # current week points to ROOT (index.html)
-    } else {
-      sprintf("ADL_%d_W%02d_playoff_and_draft_forecast.html", season, w)
-    }
-    selected_attr <- if (w == week_max) ' selected="selected"' else ""
+    href <- sprintf(
+      "ADL_%d_W%02d_playoff_and_draft_forecast.html",
+      season, display_w
+    )
+    
     sprintf(
-      '<option value="%s"%s>Week %d</option>',
-      href, selected_attr, display_w
+      '<option value="%s">Week %d</option>',
+      href, display_w
     )
   })
   
@@ -2365,6 +2365,7 @@ get_adl_playoff_picture <- function(
     '<select id="week-select" ',
     'onchange="if(this.value){ window.location.href = this.value; }" ',
     'style="margin-left: 0.5rem;">',
+    '<option value="">Select week...</option>',
     paste0(week_options, collapse = ""),
     '</select>'
   )
@@ -2419,33 +2420,42 @@ get_adl_playoff_picture <- function(
     htmltools::tags$body(
       htmltools::tags$div(
         class = "content-wrapper",
+        
+        # Header
         htmltools::tags$h2(
           sprintf(
             "ADL %d Week %d Playoff Picture & Draft Forecast",
             season, display_week
           )
         ),
+        
+        # Week dropdown
         htmltools::tags$div(
           class = "dropdown-row",
           htmltools::HTML(week_dropdown_html)
         ),
+        
+        # NEW: full dataframe link directly under dropdown
         htmltools::tags$p(
-          class = "timestamp",
-          sprintf("Last updated: %s", last_updated_str)
-        ),
-        htmltools::HTML(nfc_html),
-        htmltools::tags$br(),
-        htmltools::HTML(afc_html),
-        htmltools::tags$hr(),
-        htmltools::HTML(draft_html),
-        htmltools::tags$hr(),
-        htmltools::tags$p(
-          style = "text-align: center; margin-top: 1rem;",
+          style = "text-align: center; margin: 0.5rem 0 0.75rem 0;",
           htmltools::tags$a(
             href  = basename(full_df_file),
             "View full dataframe for this week"
           )
-        )
+        ),
+        
+        # Timestamp
+        htmltools::tags$p(
+          class = "timestamp",
+          sprintf("Last updated: %s", last_updated_str)
+        ),
+        
+        # NFC + AFC tables and draft table
+        htmltools::HTML(nfc_html),
+        htmltools::tags$br(),
+        htmltools::HTML(afc_html),
+        htmltools::tags$hr(),
+        htmltools::HTML(draft_html)
       )
     )
   )
@@ -2504,12 +2514,13 @@ get_adl_playoff_picture <- function(
   
   htmltools::save_html(full_df_page, file = full_df_file)
   
-  # Attach paths as attributes so the publisher can find them
-  attr(snapshot_final, "html_file")     <- html_file
-  attr(snapshot_final, "full_df_file")  <- full_df_file
-  attr(snapshot_final, "season")        <- season
-  attr(snapshot_final, "week")          <- week_max
-  attr(snapshot_final, "weeks_completed") <- weeks_completed
+  # Attach paths & metadata as attributes so other functions can find them
+  attr(snapshot_final, "html_file")           <- html_file
+  attr(snapshot_final, "full_df_file")        <- full_df_file
+  attr(snapshot_final, "season")              <- season
+  attr(snapshot_final, "week")                <- week_max
+  attr(snapshot_final, "weeks_completed")     <- weeks_completed
+  attr(snapshot_final, "snapshot_for_graphic") <- snapshot_for_graphic
   
   snapshot_final
 }
@@ -2821,19 +2832,22 @@ publish_adl_html_to_github <- function(
   for (wk in seq_len(through_week)) {
     message("  - Building archive HTML for week ", wk, " ...")
     
-    # Run your existing pipeline (this writes a standalone gt-based HTML file)
-    snapshot <- get_adl_playoff_picture(season = season, week = wk)
+    # Run pipeline: this writes standalone HTML files and returns snapshot df
+    snapshot <- get_adl_playoff_picture(
+      season          = season,
+      week            = wk,
+      weeks_completed = through_week
+    )
     
+    # Forecast file (playoff picture + draft forecast)
     src_forecast <- attr(snapshot, "html_file")
     if (is.null(src_forecast) || !file.exists(src_forecast)) {
       stop("get_adl_playoff_picture() did not produce a valid 'html_file' for week ", wk)
     }
     
-    # Destination forecast filename for this week
-    forecast_name <- sprintf("ADL_%d_W%02d_playoff_and_draft_forecast.html", season, wk)
+    forecast_name <- basename(src_forecast)
     forecast_dest <- file.path(repo_dir, forecast_name)
     
-    # Only copy if source and destination differ
     if (!identical(
       normalizePath(src_forecast, winslash = "\\", mustWork = TRUE),
       normalizePath(forecast_dest, winslash = "\\", mustWork = FALSE)
@@ -2841,127 +2855,35 @@ publish_adl_html_to_github <- function(
       file.copy(src_forecast, forecast_dest, overwrite = TRUE)
     }
     
+    # Full dataframe file for this week (already built by get_adl_playoff_picture)
+    src_full_df <- attr(snapshot, "full_df_file")
+    if (!is.null(src_full_df) && file.exists(src_full_df)) {
+      df_name <- basename(src_full_df)
+      df_dest <- file.path(repo_dir, df_name)
+      
+      if (!identical(
+        normalizePath(src_full_df, winslash = "\\", mustWork = TRUE),
+        normalizePath(df_dest,    winslash = "\\", mustWork = FALSE)
+      )) {
+        file.copy(src_full_df, df_dest, overwrite = TRUE)
+      }
+    }
     
-    # Remember latest week’s forecast file (for the iframe src)
+    # Remember latest week’s forecast file (for index.html iframe src)
     if (wk == through_week) {
       latest_snapshot      <- snapshot
       latest_forecast_file <- forecast_name
+      latest_full_df_file  <- if (!is.null(src_full_df)) basename(src_full_df) else NULL
     }
-    
-    # Build a full-dataframe HTML page for this week --------------------
-    df_name <- sprintf("ADL_%d_W%02d_full_dataframe.html", season, wk)
-    df_dest <- file.path(repo_dir, df_name)
-    
-    # Build a very simple, responsive HTML table for the full snapshot
-    snapshot_df <- snapshot
-    
-    # Build HTML table manually (no knitr dependency)
-    header_row <- htmltools::tags$tr(
-      lapply(names(snapshot_df), function(col) htmltools::tags$th(col))
-    )
-    
-    body_rows <- lapply(seq_len(nrow(snapshot_df)), function(i) {
-      htmltools::tags$tr(
-        lapply(snapshot_df[i, , drop = FALSE], function(val) {
-          htmltools::tags$td(as.character(val[[1]]))
-        })
-      )
-    })
-    
-    table_tag <- htmltools::tags$table(
-      htmltools::tags$thead(header_row),
-      htmltools::tags$tbody(body_rows)
-    )
-    
-    df_page <- htmltools::tagList(
-      htmltools::tags$html(
-        htmltools::tags$head(
-          htmltools::tags$meta(charset = "UTF-8"),
-          htmltools::tags$meta(
-            name    = "viewport",
-            content = "width=device-width, initial-scale=1"
-          ),
-          htmltools::tags$title(
-            sprintf("ADL %d Week %d Full Dataframe", season, wk + 1L)
-          ),
-          htmltools::tags$style(
-            htmltools::HTML("
-              body {
-                font-family: system-ui, -apple-system, BlinkMacSystemFont,
-                             'Segoe UI', sans-serif;
-                margin: 0;
-                padding: 1rem;
-              }
-              h2 {
-                text-align: center;
-                margin-bottom: 1rem;
-              }
-              .content-wrapper {
-                max-width: 1200px;
-                margin: 0 auto;
-              }
-              table {
-                border-collapse: collapse;
-                width: 100%;
-                font-size: 0.8rem;
-              }
-              th, td {
-                border: 1px solid #ccc;
-                padding: 4px 6px;
-              }
-              th {
-                background-color: #f0f0f0;
-              }
-              @media (max-width: 768px) {
-                body {
-                  padding: 0.5rem;
-                }
-                table {
-                  font-size: 0.7rem;
-                }
-              }
-            ")
-          )
-        ),
-        htmltools::tags$body(
-          htmltools::tags$div(
-            class = "content-wrapper",
-            htmltools::tags$h2(
-              sprintf("ADL %d Week %d – Full Playoff Picture Data",
-                      season, wk + 1L)
-            ),
-            table_tag
-          )
-        )
-      )
-    )
-    
-    htmltools::save_html(df_page, file = df_dest)
   }
   
   if (is.null(latest_snapshot) || is.null(latest_forecast_file)) {
     stop("Did not capture latest_snapshot / latest_forecast_file.")
   }
   
-  # 1. Build index.html with dropdown + timestamp + iframe --------------
+  # 1. Build index.html as a simple full-page iframe to latest forecast ----------
   latest_title_week <- through_week + 1L
   index_path        <- file.path(repo_dir, "index.html")
-  
-  # Dropdown: show weeks in DESCENDING order, label like "Week 4", etc.
-  weeks_vec <- rev(seq_len(through_week))
-  
-  option_tags <- lapply(weeks_vec, function(wk) {
-    label <- sprintf("Week %d", wk + 1L)
-    
-    # For the *current* week: point to index.html so user stays at root
-    href <- if (wk == through_week) {
-      "index.html"
-    } else {
-      sprintf("ADL_%d_W%02d_playoff_and_draft_forecast.html", season, wk)
-    }
-    
-    htmltools::tags$option(value = href, label)
-  })
   
   index_page <- htmltools::tagList(
     htmltools::tags$html(
@@ -2977,77 +2899,26 @@ publish_adl_html_to_github <- function(
         ),
         htmltools::tags$style(
           htmltools::HTML("
+            html, body {
+              height: 100%;
+              margin: 0;
+              padding: 0;
+            }
             body {
               font-family: system-ui, -apple-system, BlinkMacSystemFont,
                            'Segoe UI', sans-serif;
-              margin: 0;
-              padding: 1rem;
-            }
-            h2 {
-              text-align: center;
-              margin-bottom: 0.5rem;
-            }
-            .content-wrapper {
-              max-width: 1200px;
-              margin: 0 auto;
-            }
-            .dropdown-row {
-              text-align: center;
-              margin-bottom: 0.75rem;
-            }
-            .timestamp {
-              text-align: center;
-              font-style: italic;
-              font-size: 0.9rem;
-              margin-bottom: 0.75rem;
             }
             iframe {
               width: 100%;
-              height: 80vh;
+              height: 100%;
               border: none;
-            }
-            @media (max-width: 768px) {
-              body {
-                padding: 0.5rem;
-              }
-              iframe {
-                height: 85vh;
-              }
             }
           ")
         )
       ),
       htmltools::tags$body(
-        htmltools::tags$div(
-          class = "content-wrapper",
-          htmltools::tags$h2(
-            sprintf("ADL %d Week %d Playoff Picture & Draft Forecast",
-                    season, latest_title_week)
-          ),
-          htmltools::tags$div(
-            class = "dropdown-row",
-            htmltools::tags$label(
-              "Previous Forecasts: ",
-              `for` = "week-select"
-            ),
-            htmltools::tags$select(
-              id = "week-select",
-              onchange =
-                "if(this.value && this.value !== 'index.html') { window.location.href=this.value; } else if(this.value === 'index.html') { window.location.href='index.html'; }",
-              htmltools::tags$option("Select week...", value = ""),
-              option_tags
-            )
-          ),
-          htmltools::tags$div(
-            class = "timestamp",
-            sprintf(
-              "Last updated: %s",
-              format(Sys.time(), tz = "America/New_York", usetz = TRUE)
-            )
-          ),
-          htmltools::tags$iframe(
-            src = latest_forecast_file
-          )
+        htmltools::tags$iframe(
+          src = latest_forecast_file
         )
       )
     )
@@ -3064,32 +2935,11 @@ publish_adl_html_to_github <- function(
   # Helper to run git commands and *suppress* noisy stdout/stderr
   run_git <- function(cmd) {
     full_cmd <- paste("git", cmd)
-    
-    # capture stdout; stderr will still print to the console if there is an error
-    out <- tryCatch(
-      system(full_cmd, intern = TRUE, ignore.stderr = FALSE),
-      warning = function(w) {
-        # system() with intern=TRUE returns a "status" attribute on failure
-        attr_out <- attr(w, "status")
-        status <- if (is.null(attr_out)) 1L else attr_out
-        stop(
-          "Git command failed (exit code ", status, ") running: ", full_cmd,
-          "\nGit says:\n", conditionMessage(w),
-          call. = FALSE
-        )
-      }
-    )
-    
-    status <- attr(out, "status")
-    if (!is.null(status) && status != 0L) {
-      stop(
-        "Git command failed (exit code ", status, ") running: ", full_cmd,
-        "\nGit says:\n", paste(out, collapse = "\n"),
-        call. = FALSE
-      )
+    status   <- system(full_cmd, ignore.stdout = TRUE, ignore.stderr = TRUE)
+    if (status != 0) {
+      stop("Git command failed (exit code ", status, "): ", full_cmd)
     }
-    
-    invisible(out)
+    invisible(status)
   }
   
   # 2a. Quick sanity check: are we actually in a git repo?
@@ -3192,7 +3042,7 @@ points_diag$overall_sd_avg
 #######################################################################
 
 curr_season     <- 2025
-weeks_completed <- 12
+weeks_completed <- 4
 
 publish_res <- publish_adl_html_to_github(curr_season, weeks_completed)
 
