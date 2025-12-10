@@ -3063,7 +3063,7 @@ points_diag$overall_sd_avg
 #######################################################################
 
 curr_season     <- 2025
-weeks_completed <- 4
+weeks_completed <- 12
 
 publish_res <- publish_adl_html_to_github(curr_season, weeks_completed)
 
