@@ -3199,9 +3199,3 @@ publish_res <- publish_adl_html_to_github(curr_season, weeks_completed)
 adl_playoff_picture <- publish_res$latest_snapshot
 view(adl_playoff_picture)
 
-
-
-
-
-
-
