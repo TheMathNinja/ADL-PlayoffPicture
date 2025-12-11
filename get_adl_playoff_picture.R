@@ -1462,6 +1462,11 @@ run_adl_monte_carlo <- function(
   #   -> no simulation, just echo actuals as projections
   #   (Note: probabilities are handled in get_adl_playoff_picture)
   #-------------------------------------------------------
+  #-------------------------------------------------------
+  # SPECIAL CASE: season already complete (wk0 >= max_week)
+  #   -> no simulation, just echo actuals as projections
+  #   -> ALSO compute 0/1 probabilities from actual results
+  #-------------------------------------------------------
   if (wk0 >= max_week) {
     message("Snapshot week is at or beyond max_week; using actuals as projections (no simulation).")
     
@@ -1523,6 +1528,89 @@ run_adl_monte_carlo <- function(
       pred_RS_bonus = 0
     )
     
+    # --- NEW: compute 0/1 probabilities from ACTUAL final standings ---
+    final_games    <- 17L       # 12 H2H + 5 bonus events
+    ap_games_total <- (n_teams - 1L) * max_week
+    
+    standings_for_prob <- curr_teams %>%
+      dplyr::mutate(
+        win_pct = total_wins / final_games,
+        ap_win_pct = if (ap_games_total > 0) {
+          ap_wins_total / ap_games_total
+        } else {
+          NA_real_
+        }
+      )
+    
+    # Division winners
+    div_winners <- standings_for_prob %>%
+      dplyr::group_by(conference, division) %>%
+      dplyr::arrange(
+        dplyr::desc(win_pct),
+        dplyr::desc(ap_win_pct),
+        dplyr::desc(points_for)
+      ) %>%
+      dplyr::slice(1) %>%
+      dplyr::ungroup() %>%
+      dplyr::transmute(
+        franchise_id,
+        is_division_winner = TRUE
+      )
+    
+    # Wild cards = next 3 per conference among non-division winners
+    flagged <- standings_for_prob %>%
+      dplyr::left_join(div_winners, by = "franchise_id") %>%
+      dplyr::mutate(
+        is_division_winner = tidyr::replace_na(is_division_winner, FALSE)
+      )
+    
+    wild_cards <- flagged %>%
+      dplyr::filter(!is_division_winner) %>%
+      dplyr::group_by(conference) %>%
+      dplyr::arrange(
+        dplyr::desc(win_pct),
+        dplyr::desc(ap_win_pct),
+        dplyr::desc(points_for)
+      ) %>%
+      dplyr::mutate(wc_rank = dplyr::row_number()) %>%
+      dplyr::filter(wc_rank <= 3L) %>%
+      dplyr::ungroup() %>%
+      dplyr::transmute(
+        franchise_id,
+        is_wild_card = TRUE
+      )
+    
+    flagged <- flagged %>%
+      dplyr::left_join(wild_cards, by = "franchise_id") %>%
+      dplyr::mutate(
+        is_wild_card    = tidyr::replace_na(is_wild_card, FALSE),
+        is_playoff_team = is_division_winner | is_wild_card
+      )
+    
+    # Seeds for bye (seed 1 per conference)
+    playoff_seed_df <- flagged %>%
+      dplyr::filter(is_playoff_team) %>%
+      dplyr::group_by(conference) %>%
+      dplyr::arrange(
+        dplyr::desc(ap_win_pct),
+        dplyr::desc(points_for)
+      ) %>%
+      dplyr::mutate(playoff_seed = dplyr::row_number()) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(franchise_id, playoff_seed)
+    
+    flagged <- flagged %>%
+      dplyr::left_join(playoff_seed_df, by = "franchise_id")
+    
+    prob_df <- flagged %>%
+      dplyr::transmute(
+        franchise_id,
+        playoff_pct = as.numeric(is_playoff_team),
+        divwin_pct  = as.numeric(is_division_winner),
+        bye_pct     = as.numeric(!is.na(playoff_seed) & playoff_seed == 1L)
+      )
+    
+    # --- actuals as projections + probabilities -----------------------
     team_summary <- curr_teams %>%
       dplyr::mutate(
         exp_rem_ap_wins    = 0,
@@ -1532,7 +1620,8 @@ run_adl_monte_carlo <- function(
         pred_total_bonus   = bonus_wins,
         exp_rem_bonus_wins = 0,
         pred_total_wins    = total_wins
-      )
+      ) %>%
+      dplyr::left_join(prob_df, by = "franchise_id")
     
     return(list(
       team_summary  = team_summary,
@@ -1541,6 +1630,7 @@ run_adl_monte_carlo <- function(
       mean_model_m3 = NULL
     ))
   }
+  
   
   #-------------------------------------------------------
   # 1. Fit the M3 (avg_pot only) mean model at week wk0
@@ -1960,22 +2050,26 @@ run_adl_monte_carlo <- function(
 build_adl_playoff_graphic <- function(adl_picture, season, week) {
   
   # ------------------------------------------------------------------
-  # 0. Ensure new columns exist (so dplyr::all_of() doesn't explode)
+  # 0. Ensure key columns exist (light safety only)
   # ------------------------------------------------------------------
-  if (!"clinch" %in% names(adl_picture)) {
-    adl_picture$clinch <- ""
-  }
-  if (!"playoff_pct" %in% names(adl_picture)) {
-    adl_picture$playoff_pct <- NA_real_
-  }
-  if (!"divwin_pct" %in% names(adl_picture)) {
-    adl_picture$divwin_pct <- NA_real_
-  }
-  if (!"bye_pct" %in% names(adl_picture)) {
-    adl_picture$bye_pct <- NA_real_
+  safe_add <- function(df, col, default) {
+    if (!col %in% names(df)) df[[col]] <- default
+    df
   }
   
-  # Coalesce a few key columns ---------------------------------------
+  adl_picture <- adl_picture %>%
+    safe_add("clinch",      "") %>%
+    safe_add("entry",       "") %>%
+    safe_add("ap_wins",     adl_picture$ap_wins_total %||% NA_real_) %>%
+    safe_add("record",      NA_character_) %>%
+    safe_add("ap_win_pct",  NA_real_) %>%
+    safe_add("ppg",         NA_real_) %>%
+    safe_add("pot_ppg",     NA_real_) %>%
+    safe_add("playoff_pct", NA_real_) %>%
+    safe_add("divwin_pct",  NA_real_) %>%
+    safe_add("bye_pct",     NA_real_)
+  
+  # Convenience coalesces for legacy fields ---------------------------
   adl_picture <- adl_picture %>%
     dplyr::mutate(
       entry     = dplyr::coalesce(.data$entry, .data$qual),
@@ -1988,16 +2082,17 @@ build_adl_playoff_graphic <- function(adl_picture, season, week) {
     "entry",           # Qual (y/x)
     "seed",
     "franchise_name",
-    "total_wins",
+    "record",
     "ap_wins",
-    "points_for",
-    "potential_points",
+    "ap_win_pct",
+    "ppg",
+    "pot_ppg",
     "pred_wins",
     "pred_ap_wins",
     "pred_finish",
-    "playoff_pct",     # 0–1, formatted as %
-    "divwin_pct",      # 0–1, formatted as %
-    "bye_pct"          # 0–1, formatted as %
+    "playoff_pct",
+    "divwin_pct",
+    "bye_pct"
   )
   
   nfc_df <- adl_picture %>%
@@ -2023,10 +2118,11 @@ build_adl_playoff_graphic <- function(adl_picture, season, week) {
     entry            = "Qual",
     seed             = "Seed",
     franchise_name   = "Team",
-    total_wins       = "Total Wins",
+    record           = "Record",
     ap_wins          = "AP Wins",
-    points_for       = "Points For",
-    potential_points = "Potential Pts",
+    ap_win_pct       = "APwin%",
+    ppg              = "PPG",
+    pot_ppg          = "Pot. PPG",
     pred_wins        = "Pred. Wins",
     pred_ap_wins     = "Pred. AP Wins",
     pred_finish      = "Pred. Finish",
@@ -2041,33 +2137,37 @@ build_adl_playoff_graphic <- function(adl_picture, season, week) {
         title = glue::glue("{conf_label} Playoff Picture (after Week {week})")
       ) %>%
       gt::cols_label(.list = label_cols) %>%
+      # Numeric formatting
       gt::fmt_number(columns = "pred_wins",    decimals = 2) %>%
       gt::fmt_number(columns = "pred_ap_wins", decimals = 1) %>%
+      gt::fmt_number(columns = "ap_win_pct",   decimals = 3) %>%
+      gt::fmt_number(columns = c("ppg", "pot_ppg"), decimals = 1) %>%
       gt::fmt_percent(
         columns  = c("playoff_pct", "divwin_pct", "bye_pct"),
         decimals = 0
       ) %>%
+      # Clinch + Qual italic in the body
       gt::tab_style(
         style = list(
           gt::cell_text(align = "right", style = "italic")
         ),
         locations = gt::cells_body(columns = c("clinch", "entry"))
       ) %>%
-      # Clinch key (above Qual key)
+      # Clinch key (above Qual key), with capitalized words and italic letters
       gt::tab_source_note(
         gt::md(
-          "b = Clinched bye &nbsp;&nbsp;&nbsp;&nbsp; d = Clinched division &nbsp;&nbsp;&nbsp;&nbsp; p = Clinched playoffs &nbsp;&nbsp;&nbsp;&nbsp; e = Eliminated"
+          "*b* = Clinched Bye &nbsp;&nbsp;&nbsp;&nbsp; *d* = Clinched Division &nbsp;&nbsp;&nbsp;&nbsp; *p* = Clinched Playoffs &nbsp;&nbsp;&nbsp;&nbsp; *e* = Eliminated"
         )
       ) %>%
       gt::tab_source_note(
-        gt::md("y = Division winner &nbsp;&nbsp;&nbsp;&nbsp; x = Wild Card")
+        gt::md("*y* = Division Winner &nbsp;&nbsp;&nbsp;&nbsp; *x* = Wild Card")
       )
   }
   
   playoff_nfc_gt <- format_playoff_table(nfc_tbl, "NFC")
   playoff_afc_gt <- format_playoff_table(afc_tbl, "AFC")
   
-  # ---------- draft order section (unchanged) ----------------
+  # ---------- draft order section (unchanged from your logic) --------
   build_conf_draft <- function(df_conf,
                                seed_col,
                                pot_col,
@@ -2162,6 +2262,7 @@ build_adl_playoff_graphic <- function(adl_picture, season, week) {
 
 
 
+
 ####################################################
 ### DEFINE FINAL WRAPPER FUNCTION #################
 ####################################################
@@ -2169,13 +2270,11 @@ build_adl_playoff_graphic <- function(adl_picture, season, week) {
 get_adl_playoff_picture <- function(
     season,
     week,
-    max_week       = adl_max_week,
-    n_bonus_sims   = 3000L,
-    weeks_completed = week  # how many weeks you want in the dropdown
+    max_week     = adl_max_week,
+    n_bonus_sims = 3000L
 ) {
-  season          <- as.integer(season)
-  week            <- as.integer(week)
-  weeks_completed <- as.integer(weeks_completed)
+  season <- as.integer(season)
+  week   <- as.integer(week)
   
   # -------------------------------------------------
   # 0. Sanity checks / required globals
@@ -2187,22 +2286,25 @@ get_adl_playoff_picture <- function(
     stop("Global 'mfl_conns' (from load_mfl_conns()) must exist before calling get_adl_playoff_picture().")
   }
   
+  history_df <- ADL_weekly_history_2021_2025
+  
   # Clamp to regular-season max
-  week_max     <- min(week, max_week)
-  display_week <- week_max + 1L   # label "Week {display_week}" shown to users
+  week_max <- min(week, max_week)
   
   # -------------------------------------------------
   # 1. Current season-to-date standings & live seeds
   # -------------------------------------------------
   standings_raw <- build_adl_weekly_results(season = season, week = week_max)
   snapshot_curr <- add_adl_playoff_snapshot(standings_raw)
-  # snapshot_curr now has:
+  # snapshot_curr should have:
   #   qual, seed, h2h_wins, bonus_wins, total_wins,
-  #   ap_wins_total, points_for, potential_points, conference, division, etc.
+  #   ap_wins_total, points_for, potential_points,
+  #   conference, division, through_week, and raw W/L/T cols
   
   # -------------------------------------------------
   # 2. Prep inputs for Monte Carlo: sched + sd_points
   # -------------------------------------------------
+  # 2a) Connection + schedule for this season
   season_suffix <- substr(as.character(season), 3, 4)  # 2025 -> "25"
   conn_name     <- paste0("ADL", season_suffix)        # "ADL25"
   
@@ -2211,30 +2313,19 @@ get_adl_playoff_picture <- function(
     stop("No MFL connection named ", conn_name, " found in load_mfl_conns().")
   }
   
-  sched_df  <- ffscrapr::ff_schedule(mfl_conn) %>%
+  sched_df <- ffscrapr::ff_schedule(mfl_conn) %>%
     dplyr::select(week, franchise_id, opponent_id)
+  
   history_df <- ADL_weekly_history_2021_2025
   
   # -------------------------------------------------
-  # 3. Either run Monte Carlo or fall back to actuals
+  # 3. Always call Monte Carlo helper
+  #  - If week_max < max_week  => real simulation
+  #  - If week_max >= max_week => special-case branch (actuals + 0/1 probs)
   # -------------------------------------------------
-  if (week_max >= max_week) {
-    message("Snapshot week is at or beyond max_week; using actuals as projections (no simulation).")
-    
-    # No simulation: just copy actuals into pred_* fields; probs are set later
-    snapshot_pred <- snapshot_curr %>%
-      dplyr::mutate(
-        pred_ap_wins     = ap_wins_total,
-        pred_h2h_wins    = h2h_wins,
-        pred_total_bonus = bonus_wins,
-        pred_total_wins  = total_wins
-      )
-    
-    bonus_expect <- tibble::tibble(franchise_id = snapshot_pred$franchise_id)
-    weekly_h2h   <- tibble::tibble(franchise_id = snapshot_pred$franchise_id)
-    
-  } else {
-    # 2b) SD of weekly points across history (simple overall average)
+  
+  if (week_max < max_week) {
+    # SD of weekly points across history (simple overall average)
     sd_points <- history_df %>%
       dplyr::filter(week <= max_week) %>%
       dplyr::group_by(season, franchise_id) %>%
@@ -2247,60 +2338,62 @@ get_adl_playoff_picture <- function(
         .groups    = "drop"
       ) %>%
       dplyr::pull(overall_sd)
-    
-    # 3. Run Monte Carlo
-    mc_res <- run_adl_monte_carlo(
-      standings_df = snapshot_curr,
-      history_df   = history_df,
-      sched_df     = sched_df,
-      sd_points    = sd_points,
-      max_week     = max_week,
-      n_sims       = n_bonus_sims
-    )
-    # mc_res$team_summary has:
-    #   franchise_id, ap_wins_total, h2h_wins, total_wins,
-    #   pred_ap_wins, pred_h2h_wins, pred_total_bonus, pred_total_wins,
-    #   playoff_pct, divwin_pct, bye_pct, etc.
-    
-    team_pred <- mc_res$team_summary %>%
-      dplyr::select(
-        franchise_id,
-        pred_ap_wins,
-        pred_h2h_wins,
-        pred_total_bonus,
-        pred_total_wins,
-        playoff_pct,
-        divwin_pct,
-        bye_pct
-      )
-    
-    # Combine live standings with projections
-    snapshot_pred <- snapshot_curr %>%
-      dplyr::left_join(team_pred, by = "franchise_id") %>%
-      dplyr::mutate(
-        # If MC fields are missing for whatever reason, fall back to actuals
-        pred_ap_wins     = dplyr::coalesce(pred_ap_wins,     ap_wins_total),
-        pred_h2h_wins    = dplyr::coalesce(pred_h2h_wins,    h2h_wins),
-        pred_total_bonus = dplyr::coalesce(pred_total_bonus, bonus_wins),
-        pred_total_wins  = dplyr::coalesce(pred_total_wins,  total_wins)
-      )
-    
-    bonus_expect <- mc_res$bonus_expect
-    weekly_h2h   <- mc_res$weekly_h2h
-    
-    # If bonus_expect uses older names, rename them
-    if (all(c("pred_Q1_bonus", "pred_Q2_bonus", "pred_Q3_bonus",
-              "pred_Q4_bonus", "pred_RS_bonus") %in% names(bonus_expect))) {
-      bonus_expect <- bonus_expect %>%
-        dplyr::rename(
-          pred_q1_bonus_wins = pred_Q1_bonus,
-          pred_q2_bonus_wins = pred_Q2_bonus,
-          pred_q3_bonus_wins = pred_Q3_bonus,
-          pred_q4_bonus_wins = pred_Q4_bonus,
-          pred_rs_bonus_wins = pred_RS_bonus
-        )
-    }
+  } else {
+    # Value is ignored in the completed-season shortcut
+    sd_points <- 1
   }
+  
+  mc_res <- run_adl_monte_carlo(
+    standings_df = snapshot_curr,
+    history_df   = history_df,
+    sched_df     = sched_df,
+    sd_points    = sd_points,
+    max_week     = max_week,
+    n_sims       = n_bonus_sims
+  )
+  
+  team_pred <- mc_res$team_summary %>%
+    dplyr::select(
+      franchise_id,
+      pred_ap_wins,
+      pred_h2h_wins,
+      pred_total_bonus,
+      pred_total_wins,
+      playoff_pct,
+      divwin_pct,
+      bye_pct
+    )
+  
+  # Combine live standings with projections + probabilities
+  snapshot_pred <- snapshot_curr %>%
+    dplyr::left_join(team_pred, by = "franchise_id") %>%
+    dplyr::mutate(
+      # If MC fields are missing for whatever reason, fall back to actuals
+      pred_ap_wins     = dplyr::coalesce(pred_ap_wins,     ap_wins_total),
+      pred_h2h_wins    = dplyr::coalesce(pred_h2h_wins,    h2h_wins),
+      pred_total_bonus = dplyr::coalesce(pred_total_bonus, bonus_wins),
+      pred_total_wins  = dplyr::coalesce(pred_total_wins,  total_wins),
+      playoff_pct      = dplyr::coalesce(playoff_pct, 0),
+      divwin_pct       = dplyr::coalesce(divwin_pct,  0),
+      bye_pct          = dplyr::coalesce(bye_pct,      0)
+    )
+  
+  bonus_expect <- mc_res$bonus_expect
+  weekly_h2h   <- mc_res$weekly_h2h
+  
+  # If bonus_expect uses older names, rename them (unchanged from your version)
+  if (all(c("pred_Q1_bonus", "pred_Q2_bonus", "pred_Q3_bonus",
+            "pred_Q4_bonus", "pred_RS_bonus") %in% names(bonus_expect))) {
+    bonus_expect <- bonus_expect %>%
+      dplyr::rename(
+        pred_q1_bonus_wins = pred_Q1_bonus,
+        pred_q2_bonus_wins = pred_Q2_bonus,
+        pred_q3_bonus_wins = pred_Q3_bonus,
+        pred_q4_bonus_wins = pred_Q4_bonus,
+        pred_rs_bonus_wins = pred_RS_bonus
+      )
+  }
+  
   
   # -------------------------------------------------
   # 4. Win% fields for projections
@@ -2409,45 +2502,63 @@ get_adl_playoff_picture <- function(
     dplyr::left_join(weekly_h2h,   by = "franchise_id")
   
   # -------------------------------------------------
-  # 7. Probabilities + clinch flags
+  # 7. Fill probabilities (MC or deterministic) + derived fields
   # -------------------------------------------------
-  # Ensure prob columns exist
-  if (!"playoff_pct" %in% names(snapshot_seeded)) {
-    snapshot_seeded$playoff_pct <- NA_real_
-  }
-  if (!"divwin_pct" %in% names(snapshot_seeded)) {
-    snapshot_seeded$divwin_pct <- NA_real_
-  }
-  if (!"bye_pct" %in% names(snapshot_seeded)) {
-    snapshot_seeded$bye_pct <- NA_real_
-  }
-  
-  # Special case: season complete -> deterministic 0/1 probabilities
-  if (week_max >= max_week) {
-    snapshot_seeded <- snapshot_seeded %>%
-      dplyr::mutate(
-        playoff_pct = ifelse(seed <= 7L, 1, 0),    # top 7 seeds make playoffs
-        divwin_pct  = ifelse(qual == "y", 1, 0),   # 'y' = division winner
-        bye_pct     = ifelse(seed == 1L, 1, 0)     # #1 seed in each conference
-      )
-  }
-  
-  # Now compute clinch flags from probs
+  # If MC supplied playoff/div/bye probs, keep them;
+  # otherwise, derive deterministic 1/0 from projected seeds & flags.
   snapshot_seeded <- snapshot_seeded %>%
     dplyr::mutate(
-      playoff_pct = dplyr::coalesce(playoff_pct, 0),
-      divwin_pct  = dplyr::coalesce(divwin_pct,  0),
-      bye_pct     = dplyr::coalesce(bye_pct,     0),
-      clinch_playoffs    = playoff_pct >= 1 - 1e-8,
-      eliminated_playoffs = playoff_pct <= 1e-8,
-      clinch_division    = divwin_pct >= 1 - 1e-8,
-      clinch_bye         = bye_pct    >= 1 - 1e-8,
+      playoff_pct = dplyr::if_else(
+        !is.na(playoff_pct),
+        playoff_pct,
+        dplyr::if_else(pred_is_playoff_team, 1, 0, 0)
+      ),
+      divwin_pct = dplyr::if_else(
+        !is.na(divwin_pct),
+        divwin_pct,
+        dplyr::if_else(pred_is_division_winner, 1, 0, 0)
+      ),
+      bye_pct = dplyr::if_else(
+        !is.na(bye_pct),
+        bye_pct,
+        dplyr::if_else(pred_is_playoff_team & pred_playoff_seed == 1L, 1, 0, 0)
+      )
+    )
+  
+  # Record W-L-T from raw components
+  snapshot_seeded <- snapshot_seeded %>%
+    dplyr::mutate(
+      wins_raw = dplyr::coalesce(h2h_wins_raw, 0)   + dplyr::coalesce(bonus_wins_raw, 0),
+      loss_raw = dplyr::coalesce(h2h_losses_raw, 0) + dplyr::coalesce(bonus_losses_raw, 0),
+      tie_raw  = dplyr::coalesce(h2h_ties_raw, 0)   + dplyr::coalesce(bonus_ties_raw, 0),
+      record   = sprintf("%d-%d-%d", wins_raw, loss_raw, tie_raw)
+    )
+  
+  # AP win% to date, PPG, Pot PPG
+  snapshot_seeded <- snapshot_seeded %>%
+    dplyr::mutate(
+      ap_win_pct = dplyr::if_else(
+        through_week > 0,
+        ap_wins_total / ((n_teams - 1L) * through_week),
+        NA_real_
+      ),
+      ppg      = dplyr::if_else(through_week > 0, points_for       / through_week, NA_real_),
+      pot_ppg  = dplyr::if_else(through_week > 0, potential_points / through_week, NA_real_)
+    )
+  
+  # Clinch flags
+  snapshot_seeded <- snapshot_seeded %>%
+    dplyr::mutate(
+      clinch_division   = divwin_pct  >= 1 - 1e-9,
+      clinch_bye        = bye_pct     >= 1 - 1e-9,
+      clinch_playoffs   = playoff_pct >= 1 - 1e-9,
+      eliminated_playoffs = playoff_pct <= 1e-9,
       clinch = dplyr::case_when(
-        clinch_bye          ~ "b",
-        clinch_division     ~ "d",
-        clinch_playoffs     ~ "p",
-        eliminated_playoffs ~ "e",
-        TRUE                ~ ""
+        clinch_bye                      ~ "b",
+        clinch_division                 ~ "d",
+        clinch_playoffs                 ~ "p",
+        eliminated_playoffs             ~ "e",
+        TRUE                            ~ ""
       )
     )
   
@@ -2467,235 +2578,50 @@ get_adl_playoff_picture <- function(
   snapshot_final <- snapshot_seeded %>%
     dplyr::mutate(
       pred_total_wins = round(pred_total_wins, 2),
-      pred_ap_wins    = round(pred_ap_wins,    1)
+      pred_ap_wins    = round(pred_ap_wins,    1),
+      APwin_display   = round(ap_win_pct,      3),
+      PPG_display     = round(ppg,             1),
+      PotPPG_display  = round(pot_ppg,         1)
     ) %>%
     dplyr::rename(
-      Clinch          = clinch,
-      Qual            = qual,
-      Seed            = seed,
-      Team            = franchise_name,
-      `Total Wins`    = total_wins,
-      `AP Wins`       = ap_wins_total,
-      `Points For`    = points_for,
-      `Potential Pts` = potential_points,
-      `Pred. Wins`    = pred_total_wins,
-      `Pred. AP Wins` = pred_ap_wins,
-      `Pred. Finish`  = pred_finish,
-      `Playoff%`      = playoff_pct,
-      `Div%`          = divwin_pct,
-      `Bye%`          = bye_pct
+      Clinch         = clinch,
+      Qual           = qual,
+      Seed           = seed,
+      Team           = franchise_name,
+      Record         = record,
+      `Total Wins`   = total_wins,
+      `AP Wins`      = ap_wins_total,
+      `Points For`   = points_for,
+      `Potential Pts`= potential_points,
+      `Pred. Wins`   = pred_total_wins,
+      `Pred. AP Wins`= pred_ap_wins,
+      `Pred. Finish` = pred_finish,
+      `Playoff%`     = playoff_pct,
+      `Div%`         = divwin_pct,
+      `Bye%`         = bye_pct
+    ) %>%
+    dplyr::mutate(
+      `APwin%`  = APwin_display,
+      PPG       = PPG_display,
+      `Pot. PPG`= PotPPG_display
     ) %>%
     dplyr::arrange(conference, Seed) %>%
     dplyr::relocate(
       Clinch, Qual, Seed, Team,
-      `Total Wins`, `AP Wins`,
-      `Points For`, `Potential Pts`,
-      `Pred. Wins`, `Pred. AP Wins`, `Pred. Finish`,
-      `Playoff%`, `Div%`, `Bye%`
+      Record,
+      `Total Wins`, `AP Wins`, `APwin%`,
+      PPG, `Pot. PPG`,
+      `Pred. Wins`, `Pred. AP Wins`, `Pred. Finish`
     ) %>%
     # Keep conference & division at the end for grouping
     dplyr::relocate(conference, division, .after = dplyr::last_col())
   
   # -------------------------------------------------
-  # 10. Build gt tables and HTML
+  # 10. Attach attributes for downstream functions
   # -------------------------------------------------
-  graphics_list <- build_adl_playoff_graphic(
-    adl_picture = snapshot_for_graphic,
-    season      = season,
-    week        = week_max  # "after Week {week_max}" for table subtitles
-  )
-  
-  nfc_gt   <- graphics_list$playoff_nfc
-  afc_gt   <- graphics_list$playoff_afc
-  draft_gt <- graphics_list$draft_table
-  
-  out_dir <- "C:/Users/filim/Documents/R/LeagueFeatures/PlayoffPicture"
-  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-  
-  html_file <- file.path(
-    out_dir,
-    sprintf("ADL_%d_W%02d_playoff_and_draft_forecast.html", season, display_week)
-  )
-  full_df_file <- file.path(
-    out_dir,
-    sprintf("ADL_%d_W%02d_full_dataframe.html", season, display_week)
-  )
-  
-  # Render gt tables to raw HTML
-  nfc_html   <- gt::as_raw_html(nfc_gt)
-  afc_html   <- gt::as_raw_html(afc_gt)
-  draft_html <- gt::as_raw_html(draft_gt)
-  
-  # Full dataframe page (simple gt table)
-  full_df_gt   <- gt::gt(snapshot_final)
-  full_df_html <- gt::as_raw_html(full_df_gt)
-  
-  last_updated_str <- format(Sys.time(), tz = "America/New_York", usetz = TRUE)
-  
-  # ---------- WEEK DROPDOWN (inline, always all weeks, descending) ----------
-  week_seq <- rev(seq_len(weeks_completed))
-  week_options <- vapply(week_seq, FUN.VALUE = character(1L), function(w) {
-    display_w <- w + 1L
-    href <- sprintf(
-      "ADL_%d_W%02d_playoff_and_draft_forecast.html",
-      season, display_w
-    )
-    sprintf(
-      '<option value="%s">Week %d</option>',
-      href, display_w
-    )
-  })
-  
-  week_dropdown_html <- paste0(
-    '<label for="week-select">Previous Forecasts:</label>',
-    '<select id="week-select" ',
-    'onchange="if(this.value){ window.location.href = this.value; }" ',
-    'style="margin-left: 0.5rem;">',
-    '<option value="">Select week...</option>',
-    paste0(week_options, collapse = ""),
-    '</select>'
-  )
-  
-  # ---------- MAIN PAGE ----------
-  page <- htmltools::tagList(
-    htmltools::tags$head(
-      htmltools::tags$meta(charset = "UTF-8"),
-      htmltools::tags$meta(
-        name    = "viewport",
-        content = "width=device-width, initial-scale=1"
-      ),
-      htmltools::tags$title(
-        sprintf(
-          "ADL %d Week %d Playoff Picture & Draft Forecast",
-          season, display_week
-        )
-      ),
-      htmltools::tags$style(htmltools::HTML(
-        "body {
-           font-family: system-ui, -apple-system, BlinkMacSystemFont,
-                        'Segoe UI', sans-serif;
-           margin: 0;
-           padding: 1rem;
-         }
-         h2 {
-           text-align: center;
-           margin-bottom: 0.5rem;
-         }
-         .content-wrapper {
-           max-width: 1200px;
-           margin: 0 auto;
-         }
-         .dropdown-row {
-           text-align: center;
-           margin-bottom: 1rem;
-         }
-         .timestamp {
-           text-align: center;
-           font-style: italic;
-           font-size: 0.9rem;
-           margin-top: 0.5rem;
-         }
-         @media (max-width: 768px) {
-           body {
-             padding: 0.5rem;
-           }
-         }"
-      ))
-    ),
-    htmltools::tags$body(
-      htmltools::tags$div(
-        class = "content-wrapper",
-        htmltools::tags$h2(
-          sprintf(
-            "ADL %d Week %d Playoff Picture & Draft Forecast",
-            season, display_week
-          )
-        ),
-        htmltools::tags$div(
-          class = "dropdown-row",
-          htmltools::HTML(week_dropdown_html)
-        ),
-        htmltools::tags$p(
-          style = "text-align: center; margin: 0.5rem 0 0.75rem 0;",
-          htmltools::tags$a(
-            href  = basename(full_df_file),
-            "View full dataframe for this week"
-          )
-        ),
-        htmltools::tags$p(
-          class = "timestamp",
-          sprintf("Last updated: %s", last_updated_str)
-        ),
-        htmltools::HTML(nfc_html),
-        htmltools::tags$br(),
-        htmltools::HTML(afc_html),
-        htmltools::tags$hr(),
-        htmltools::HTML(draft_html)
-      )
-    )
-  )
-  
-  htmltools::save_html(page, file = html_file)
-  
-  # ---------- FULL DATAFRAME PAGE ----------
-  full_df_page <- htmltools::tagList(
-    htmltools::tags$head(
-      htmltools::tags$meta(charset = "UTF-8"),
-      htmltools::tags$meta(
-        name    = "viewport",
-        content = "width=device-width, initial-scale=1"
-      ),
-      htmltools::tags$title(
-        sprintf(
-          "ADL %d Week %d - Full Dataframe",
-          season, display_week
-        )
-      ),
-      htmltools::tags$style(htmltools::HTML(
-        "body {
-           font-family: system-ui, -apple-system, BlinkMacSystemFont,
-                        'Segoe UI', sans-serif;
-           margin: 0;
-           padding: 1rem;
-         }
-         h2 {
-           text-align: center;
-           margin-bottom: 0.5rem;
-         }
-         .content-wrapper {
-           max-width: 1200px;
-           margin: 0 auto;
-         }
-         @media (max-width: 768px) {
-           body {
-             padding: 0.5rem;
-           }
-         }"
-      ))
-    ),
-    htmltools::tags$body(
-      htmltools::tags$div(
-        class = "content-wrapper",
-        htmltools::tags$h2(
-          sprintf(
-            "ADL %d Week %d - Full Dataframe",
-            season, display_week
-          )
-        ),
-        htmltools::HTML(full_df_html)
-      )
-    )
-  )
-  
-  htmltools::save_html(full_df_page, file = full_df_file)
-  
-  # Attach paths & metadata
-  attr(snapshot_final, "html_file")            <- html_file
-  attr(snapshot_final, "full_df_file")         <- full_df_file
+  attr(snapshot_final, "snapshot_for_graphic") <- snapshot_for_graphic
   attr(snapshot_final, "season")               <- season
   attr(snapshot_final, "week")                 <- week_max
-  attr(snapshot_final, "weeks_completed")      <- weeks_completed
-  attr(snapshot_final, "snapshot_for_graphic") <- snapshot_for_graphic
   
   snapshot_final
 }
@@ -2759,10 +2685,6 @@ build_adl_week_dropdown <- function(season,
 
 
 
-
-# Build BOTH pages for a single week:
-#   1) Playoff Picture & Draft Forecast page
-#   2) Full dataframe page
 # --------------------------------------------------------------------
 # Write both HTML pages for a given week:
 #   1) Playoff Picture & Draft Forecast page
@@ -2820,25 +2742,26 @@ write_adl_week_html <- function(snapshot,
   week_display <- week + 1L
   updated_at   <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
   
-  # ----------------- Dropdown for archived weeks --------------------
+  # ----------------- Dropdown for all weeks --------------------------
   build_adl_week_dropdown <- function(season,
                                       weeks_completed,
                                       current_week) {
-    if (weeks_completed <= 1L) {
+    if (weeks_completed <= 0L) {
       return(NULL)
     }
     
-    archived_weeks <- seq(weeks_completed - 1L, 1L, by = -1L)
+    # Underlying weeks: 1..weeks_completed → display weeks: 2..weeks_completed+1
+    week_seq <- rev(seq_len(weeks_completed))  # show latest at top (after "Select week...")
     
-    options <- lapply(archived_weeks, function(wk) {
-      display_week <- wk + 1L  # label & URL use “after Week {wk+1}”
+    option_tags <- lapply(week_seq, function(wk) {
+      display_week <- wk + 1L  # “after Week {wk}”
       
       file_name <- sprintf(
         "ADL_%d_W%02d_playoff_and_draft_forecast.html",
         season, display_week
       )
       
-      label <- sprintf("Season %d – Week %d", season, display_week)
+      label <- sprintf("Week %d", display_week)
       
       htmltools::tags$option(
         value    = file_name,
@@ -2847,15 +2770,21 @@ write_adl_week_html <- function(snapshot,
       )
     })
     
+    # Add the "Select week..." option at the top
+    option_tags <- c(
+      list(htmltools::tags$option(value = "", "Select week...")),
+      option_tags
+    )
+    
     htmltools::tags$div(
       style = "text-align:center; margin: 0 auto 1rem auto;",
       htmltools::tags$label(
-        "Jump to week: ",
+        "Previous Forecasts: ",
         do.call(
           htmltools::tags$select,
           c(
             list(onchange = "if (this.value) window.location.href=this.value;"),
-            options
+            option_tags
           )
         )
       )
@@ -2912,7 +2841,7 @@ write_adl_week_html <- function(snapshot,
       style = "text-align:center; margin-bottom: 1rem;",
       htmltools::tags$a(
         href = full_df_file_name,
-        "View full dataframe for this week"
+        "View Full Weekly Data"
       )
     ),
     htmltools::tags$div(
@@ -2990,6 +2919,38 @@ write_adl_week_html <- function(snapshot,
     week_file    = main_file_path,
     full_df_file = full_df_file_path
   ))
+}
+
+
+preview_adl_playoff_picture <- function(
+    season,
+    week,
+    repo_dir = "C:/Users/filim/Documents/R/LeagueFeatures/PlayoffPicture"
+) {
+  season <- as.integer(season)
+  week   <- as.integer(week)
+  
+  # 1) Build the underlying playoff picture tibble
+  snapshot <- get_adl_playoff_picture(
+    season = season,
+    week   = week
+  )
+  
+  # 2) Write HTML for THIS week only (no archive rebuild, no git)
+  #    Assumes write_adl_week_html(snapshot, season, week, repo_dir)
+  #    returns a list with elements $week_file and $full_file
+  html_files <- write_adl_week_html(
+    snapshot = snapshot,
+    season   = season,
+    week     = week,
+    repo_dir = repo_dir
+  )
+  
+  # 3) Attach paths so you can browse them easily
+  attr(snapshot, "html_file")    <- html_files$week_file
+  attr(snapshot, "full_df_file") <- html_files$full_file
+  
+  snapshot
 }
 
 
@@ -3214,11 +3175,16 @@ points_diag$overall_sd_avg
 curr_season     <- 2025
 weeks_completed <- 12
 
-# Build this week's playoff picture + HTML
-adl_playoff_picture <- get_adl_playoff_picture(curr_season, weeks_completed)
-# Inspect the data frame
+# Step 1: Build underlying df + generate HTML locally
+adl_playoff_picture <- preview_adl_playoff_picture(
+  season = curr_season,
+  week   = weeks_completed
+)
+
+# Step 2: Inspect the tibble
 view(adl_playoff_picture)
-# Open the local HTML in your browser to eyeball the layout
+
+# Step 3: Manually reopen the HTML (optional)
 browseURL(attr(adl_playoff_picture, "html_file"))
 
 
